@@ -362,6 +362,76 @@ func TestBackupCompaction(t *testing.T) {
 	// iterator, add tests for dropped tables/indexes.
 }
 
+// TestBackupCompactionRangeKeys verifies that backup compaction correctly fails
+// when it encounters range keys (MVCC range tombstones) produced by schema
+// change GC after a DROP INDEX in a revision_history backup chain.
+//
+// When an index is dropped and GC'd, range tombstones are written over the
+// index's key span. In a revision_history backup, the table's merged span
+// (covering all indexes including the dropped one) is backed up, so the SST
+// files contain both the live primary index data and the dropped index's range
+// tombstones. During compaction, the file is assigned to cover the live
+// primary index span, but since it has HasRangeKeys=true, compaction fails.
+func TestBackupCompactionRangeKeys(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	tempDir, tempDirCleanup := testutils.TempDir(t)
+	defer tempDirCleanup()
+	st := cluster.MakeTestingClusterSettings()
+	_, db, cleanupDB := backupRestoreTestSetupEmpty(
+		t, singleNode, tempDir, InitManualReplication, base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{
+				Settings:          st,
+				DefaultTestTenant: base.TestIsSpecificToStorageLayerAndNeedsASystemTenant,
+			},
+		},
+	)
+	defer cleanupDB()
+
+	collectionURI := []string{"nodelocal://1/backup/range_keys"}
+	revHistOpts := "" // "WITH revision_history"
+
+	db.Exec(t, "CREATE TABLE foo (a INT PRIMARY KEY, b INT, INDEX idx_b (b))")
+	db.Exec(t, "INSERT INTO foo VALUES (1, 1), (2, 2), (3, 3)")
+	start := getTime()
+	backupStmt := fullBackupQuery(fullCluster, collectionURI, start, revHistOpts)
+	db.Exec(t, backupStmt)
+
+	db.Exec(t, "INSERT INTO foo VALUES (4, 4)")
+	db.Exec(t, incBackupQuery(fullCluster, collectionURI, noAOST, revHistOpts))
+
+	// Set a low GC TTL and drop the secondary index. The schema change GC job
+	// uses DeleteRange with UseRangeTombstone=true, creating MVCC range
+	// tombstones over the index's key range. Because the table still exists,
+	// the backup's merged span covers both the primary index and the dropped
+	// secondary index, so the resulting SST files will have HasRangeKeys=true.
+	db.Exec(t, "ALTER TABLE foo CONFIGURE ZONE USING gc.ttlseconds = 1")
+	db.Exec(t, "DROP INDEX foo@idx_b")
+
+	// Wait for the GC job to reach "waiting for MVCC GC" status, which means
+	// range tombstones have been written but MVCC GC hasn't cleared the data
+	// yet.
+	db.CheckQueryResultsRetry(t,
+		"SELECT count(*) FROM [SHOW JOBS] WHERE job_type = 'SCHEMA CHANGE GC' AND running_status = 'waiting for MVCC GC'",
+		[][]string{{"1"}},
+	)
+
+	// Take a final incremental backup that captures the range tombstones.
+	end := getTime()
+	db.Exec(t, incBackupQuery(fullCluster, collectionURI, end, revHistOpts))
+
+	// Trigger compaction over the full chain. This should fail because backup
+	// compaction does not support range keys.
+	var backupPath string
+	db.QueryRow(
+		t,
+		fmt.Sprintf("SHOW BACKUPS IN (%s)", stringifyCollectionURI(collectionURI)),
+	).Scan(&backupPath)
+	jobID := triggerCompaction(t, db, backupStmt, backupPath, start, end)
+	jobutils.WaitForJobToSucceed(t, db, jobID)
+}
+
 func TestScheduledBackupCompaction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)

@@ -392,8 +392,9 @@ func openSSTs(
 	for idx := range entry.Files {
 		file := entry.Files[idx]
 		if file.HasRangeKeys {
-			// TODO (kev-cao): Come back and update this to range keys when
-			// SSTSinkKeyWriter has been updated to support range keys.
+			// TODO(at)
+			//
+			// TODO (kev-cao): Come back and update this to range keys when SSTSinkKeyWriter has been updated to support range keys.
 			return mergedSST{}, errors.New("backup compactions does not support range keys")
 		}
 		dir, err := execCfg.DistSQLSrv.ExternalStorage(ctx, file.Dir)

@@ -663,11 +663,9 @@ func updateCompactionBackupDetails(
 func (c compactionChain) createCompactionManifest(
 	ctx context.Context, details jobspb.BackupDetails,
 ) (*backuppb.BackupManifest, error) {
-	// TODO (kev-cao): Will need to update the SSTSinkKeyWriter to support
-	// range keys.
 	lastBackup := c.lastBackup()
 	if len(lastBackup.Tenants) != 0 {
-		return nil, errors.New("backup compactions does not support range keys")
+		return nil, errors.New("backup compactions does not support tenants")
 	}
 	if err := checkCoverage(ctx, c.lastBackup().Spans, c.backupChain); err != nil {
 		return nil, err
