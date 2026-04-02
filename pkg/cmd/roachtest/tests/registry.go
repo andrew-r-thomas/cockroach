@@ -116,6 +116,7 @@ func RegisterTests(r registry.Registry) {
 	registerMultiTenantTPCH(r)
 	registerMultiTenantUpgrade(r)
 	registerMultiTenantSharedProcess(r)
+	registerAnalyzeTimingScratch(r)
 	registerNetwork(r)
 	registerBufferedLogging(r)
 	registerNodeJSPostgres(r)

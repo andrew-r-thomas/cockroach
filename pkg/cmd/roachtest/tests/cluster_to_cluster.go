@@ -26,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/crosscluster/replicationutils"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -760,7 +761,7 @@ func (rd *replicationDriver) preStreamingWorkload(ctx context.Context) {
 			// can leave some tables without stats for 15+ minutes after import,
 			// causing bad query plans and CPU saturation on the reader tenant
 			// workload. See #164639.
-			rd.t.Status("collecting table statistics on source tenant")
+			rd.t.Status("collecting table statistics on source tenant (parallel)")
 			analyzeStart := timeutil.Now()
 			srcTenantConn := rd.c.Conn(
 				ctx, rd.t.L(), rd.setup.src.nodes[0],
@@ -775,16 +776,35 @@ func (rd *replicationDriver) preStreamingWorkload(ctx context.Context) {
 			rows := srcTenantSQL.QueryStr(
 				rd.t, `SELECT table_name FROM [SHOW TABLES]`,
 			)
+			g := ctxgroup.WithContext(ctx)
 			for _, row := range rows {
 				tableName := row[0]
-				rd.t.L().Printf("running ANALYZE on %q", tableName)
-				srcTenantSQL.Exec(
-					rd.t, fmt.Sprintf(`ANALYZE "%s"`, tableName),
-				)
+				g.GoCtx(func(ctx context.Context) error {
+					c := rd.c.Conn(
+						ctx, rd.t.L(), rd.setup.src.nodes[0],
+						option.VirtualClusterName(rd.setup.src.name),
+						option.DBName("tpcc"),
+						option.User("root"),
+						option.AuthMode(install.AuthRootCert),
+					)
+					defer c.Close()
+					tableStart := timeutil.Now()
+					rd.t.L().Printf("running ANALYZE on %q", tableName)
+					if _, err := c.ExecContext(ctx, fmt.Sprintf(`ANALYZE "%s"`, tableName)); err != nil {
+						return err
+					}
+					rd.t.L().Printf("ANALYZE %q took %s (parallel)", tableName, timeutil.Since(tableStart))
+					return nil
+				})
+			}
+			if err := g.Wait(); err != nil {
+				rd.t.Fatal(err)
 			}
 			rd.t.L().Printf(
 				"table statistics collection took %s", timeutil.Since(analyzeStart),
 			)
+			// TODO(at): Remove this after measuring ANALYZE timing on real hardware.
+			rd.t.Fatal("early exit after ANALYZE timing measurement")
 		}
 	}
 }
@@ -1341,12 +1361,13 @@ func c2cRegisterWrapper(
 		clusterOps = append(clusterOps, spec.Geo())
 	}
 
-	nativeLibs := []string{}
-	if sp.withReaderWorkload != nil {
-		// Read from standby tests also spin up the schema change workload which
-		// requires LibGEOS.
-		nativeLibs = registry.LibGEOS
-	}
+	// TODO(at): Restore after ANALYZE timing measurement.
+	// nativeLibs := []string{}
+	// if sp.withReaderWorkload != nil {
+	// 	// Read from standby tests also spin up the schema change workload which
+	// 	// requires LibGEOS.
+	// 	nativeLibs = registry.LibGEOS
+	// }
 
 	r.Add(registry.TestSpec{
 		Name:                      sp.name,
@@ -1363,7 +1384,8 @@ func c2cRegisterWrapper(
 		// Read from standby tests also spin up the schema change workload which
 		// uses the workload binary.
 		RequiresDeprecatedWorkload: sp.withReaderWorkload != nil,
-		NativeLibs:                 nativeLibs,
+		// TODO(at): Restore after ANALYZE timing measurement.
+		// NativeLibs:                 nativeLibs,
 	})
 }
 
